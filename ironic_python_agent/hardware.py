@@ -68,6 +68,7 @@ def _udev_settle():
     """
     try:
         utils.execute('udevadm', 'settle')
+        utils.execute('iscsistart','-b')
     except processutils.ProcessExecutionError as e:
         LOG.warning('Something went wrong when waiting for udev '
                     'to settle. Error: %s', e)
