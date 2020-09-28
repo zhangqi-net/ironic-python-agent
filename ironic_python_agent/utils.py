@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+try:
+    from collections import abc
+except ImportError:
+    # Python 2
+    import collections as abc
 import copy
 import errno
 import glob
@@ -24,11 +29,13 @@ import tarfile
 import tempfile
 import time
 
+from ironic_lib import disk_utils
 from ironic_lib import utils as ironic_utils
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_serialization import base64
 from oslo_utils import units
+import six
 from six.moves.urllib import parse
 
 from ironic_python_agent import errors
@@ -63,7 +70,8 @@ COLLECT_LOGS_COMMANDS = {
 
 DEVICE_EXTRACTOR = re.compile(r'^(?:(.*\d)p|(.*\D))(?:\d+)$')
 
-PARTED_ESP_PATTERN = re.compile(r'^\s*(\d+)\s.*\s\s.*\s.*esp(,|\s|$).*$')
+PARTED_TABLE_TYPE_REGEX = re.compile(r'^.*partition\s+table\s*:\s*(gpt|msdos)',
+                                     re.IGNORECASE)
 
 
 def execute(*cmd, **kwargs):
@@ -457,21 +465,55 @@ def extract_device(part):
     return (m.group(1) or m.group(2))
 
 
+def scan_partition_table_type(device):
+    """Get partition table type, msdos or gpt.
+
+    :param device_name: the name of the device
+    :return: msdos, gpt or unknown
+    """
+    out, _u = execute('parted', '-s', device, '--', 'print')
+    out = out.splitlines()
+
+    for line in out:
+        m = PARTED_TABLE_TYPE_REGEX.match(line)
+        if m:
+            return m.group(1)
+
+    LOG.warning("Unable to get partition table type for device %s.",
+                device)
+
+    return 'unknown'
+
+
 def get_efi_part_on_device(device):
-    """Looks for the efi partition on a given device
+    """Looks for the efi partition on a given device.
+
+    A boot partition on a GPT disk is assumed to be an EFI partition as well.
 
     :param device: lock device upon which to check for the efi partition
     :return: the efi partition or None
     """
-    efi_part = None
-    out, _u = execute('parted', '-s', device, '--', 'print')
-    for line in out.splitlines():
-        m = PARTED_ESP_PATTERN.match(line)
-        if m:
-            efi_part = m.group(1)
-
-            LOG.debug("Found efi partition %s on device %s.", efi_part, device)
-            break
+    is_gpt = scan_partition_table_type(device) == 'gpt'
+    for part in disk_utils.list_partitions(device):
+        flags = {x.strip() for x in part['flags'].split(',')}
+        if 'esp' in flags or ('boot' in flags and is_gpt):
+            LOG.debug("Found EFI partition %s on device %s.", part, device)
+            return part['number']
     else:
         LOG.debug("No efi partition found on device %s", device)
-    return efi_part
+
+
+_LARGE_KEYS = frozenset(['configdrive', 'system_logs'])
+
+
+def remove_large_keys(var):
+    """Remove specific keys from the var, recursing into dicts and lists."""
+    if isinstance(var, abc.Mapping):
+        return {key: (remove_large_keys(value)
+                      if key not in _LARGE_KEYS else '<...>')
+                for key, value in var.items()}
+    elif isinstance(var, abc.Sequence) and not isinstance(var,
+                                                          six.string_types):
+        return var.__class__(map(remove_large_keys, var))
+    else:
+        return var

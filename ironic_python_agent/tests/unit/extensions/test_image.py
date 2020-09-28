@@ -45,6 +45,8 @@ class TestImageExtension(base.IronicAgentTest):
         self.fake_efi_system_part_uuid = '45AB-2312'
         self.fake_prep_boot_part_uuid = '76937797-3253-8843-999999999999'
         self.fake_dir = '/tmp/fake-dir'
+        self.agent_extension.agent = mock.Mock()
+        self.agent_extension.agent.iscsi_started = True
 
     @mock.patch.object(iscsi, 'clean_up', autospec=True)
     @mock.patch.object(image, '_install_grub2', autospec=True)
@@ -103,9 +105,13 @@ class TestImageExtension(base.IronicAgentTest):
 
         mock_execute.side_effect = iter([('', ''), ('', ''),
                                          ('', ''), ('', ''),
+                                         ('', ''), ('', ''),
                                          ('', ''), ('', '')])
 
         expected = [mock.call('efibootmgr', '--version'),
+                    mock.call('partx', '-u', '/dev/fake', attempts=3,
+                              delay_on_retry=True),
+                    mock.call('udevadm', 'settle'),
                     mock.call('mount', self.fake_efi_system_part,
                               self.fake_dir + '/boot/efi'),
                     mock.call('efibootmgr'),
@@ -127,7 +133,7 @@ class TestImageExtension(base.IronicAgentTest):
         mock_efi_bl.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_execute.assert_has_calls(expected)
         mock_utils_efi_part.assert_called_once_with(self.fake_dev)
-        self.assertEqual(6, mock_execute.call_count)
+        self.assertEqual(8, mock_execute.call_count)
 
     @mock.patch.object(os.path, 'exists', lambda *_: False)
     @mock.patch.object(iscsi, 'clean_up', autospec=True)
@@ -146,9 +152,13 @@ class TestImageExtension(base.IronicAgentTest):
         mock_efi_bl.return_value = ['\\EFI\\BOOT\\BOOTX64.EFI']
         mock_execute.side_effect = iter([('', ''), ('', ''),
                                          ('', ''), ('', ''),
+                                         ('', ''), ('', ''),
                                          ('', ''), ('', '')])
 
         expected = [mock.call('efibootmgr', '--version'),
+                    mock.call('partx', '-u', '/dev/fake', attempts=3,
+                              delay_on_retry=True),
+                    mock.call('udevadm', 'settle'),
                     mock.call('mount', self.fake_efi_system_part,
                               self.fake_dir + '/boot/efi'),
                     mock.call('efibootmgr'),
@@ -170,7 +180,7 @@ class TestImageExtension(base.IronicAgentTest):
         mock_efi_bl.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_execute.assert_has_calls(expected)
         mock_utils_efi_part.assert_called_once_with(self.fake_dev)
-        self.assertEqual(6, mock_execute.call_count)
+        self.assertEqual(8, mock_execute.call_count)
 
     @mock.patch.object(os.path, 'exists', lambda *_: False)
     @mock.patch.object(iscsi, 'clean_up', autospec=True)
@@ -192,11 +202,15 @@ efibootmgr: ** Warning ** : Boot0004 has same label ironic1\n
 efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
 """
         mock_execute.side_effect = iter([('', ''), ('', ''),
+                                         ('', ''), ('', ''),
                                          ('', ''), ('', stdeer_msg),
                                          ('', ''), ('', ''),
                                          ('', ''), ('', '')])
 
         expected = [mock.call('efibootmgr', '--version'),
+                    mock.call('partx', '-u', '/dev/fake', attempts=3,
+                              delay_on_retry=True),
+                    mock.call('udevadm', 'settle'),
                     mock.call('mount', self.fake_efi_system_part,
                               self.fake_dir + '/boot/efi'),
                     mock.call('efibootmgr'),
@@ -220,7 +234,7 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
         mock_efi_bl.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_execute.assert_has_calls(expected)
         mock_utils_efi_part.assert_called_once_with(self.fake_dev)
-        self.assertEqual(8, mock_execute.call_count)
+        self.assertEqual(10, mock_execute.call_count)
 
     @mock.patch.object(os.path, 'exists', lambda *_: False)
     @mock.patch.object(iscsi, 'clean_up', autospec=True)
@@ -242,9 +256,13 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
         mock_execute.side_effect = iter([('', ''), ('', ''),
                                          ('', ''), ('', ''),
                                          ('', ''), ('', ''),
+                                         ('', ''), ('', ''),
                                          ('', '')])
 
         expected = [mock.call('efibootmgr', '--version'),
+                    mock.call('partx', '-u', '/dev/fake', attempts=3,
+                              delay_on_retry=True),
+                    mock.call('udevadm', 'settle'),
                     mock.call('mount', self.fake_efi_system_part,
                               self.fake_dir + '/boot/efi'),
                     mock.call('efibootmgr'),
@@ -270,7 +288,7 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
         mock_efi_bl.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_execute.assert_has_calls(expected)
         mock_utils_efi_part.assert_called_once_with(self.fake_dev)
-        self.assertEqual(7, mock_execute.call_count)
+        self.assertEqual(9, mock_execute.call_count)
 
     @mock.patch.object(iscsi, 'clean_up', autospec=True)
     @mock.patch.object(image, '_install_grub2', autospec=True)
@@ -292,6 +310,28 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
             efi_system_part_uuid=None,
             prep_boot_part_uuid=self.fake_prep_boot_part_uuid)
         mock_iscsi_clean.assert_called_once_with(self.fake_dev)
+
+    @mock.patch.object(os.path, 'exists', lambda *_: False)
+    @mock.patch.object(iscsi, 'clean_up', autospec=True)
+    def test_install_bootloader_failure(self, mock_iscsi_clean, mock_execute,
+                                        mock_dispatch):
+        # NOTE(iurygregory): adaptation for py27 since we don't have
+        # FileNotFoundError defined.
+        try:
+            FileNotFoundError
+        except NameError:
+            FileNotFoundError = OSError
+
+        mock_dispatch.side_effect = [
+            self.fake_dev, hardware.BootInfo(current_boot_mode='uefi')
+        ]
+        mock_execute.side_effect = FileNotFoundError
+        self.assertRaises(FileNotFoundError,
+                          self.agent_extension.install_bootloader,
+                          root_uuid=self.fake_root_uuid,
+                          efi_system_part_uuid=None)
+        expected = [mock.call('efibootmgr', '--version')]
+        mock_execute.assert_has_calls(expected)
 
     @mock.patch.object(image, '_is_bootloader_loaded', lambda *_: False)
     @mock.patch.object(hardware, 'is_md_device', autospec=True)
@@ -673,6 +713,8 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
 
     def test__is_bootloader_loaded(self, mock_execute,
                                    mock_dispatch):
+        mock_dispatch.return_value = hardware.BootInfo(
+            current_boot_mode='bios')
         parted_output = ('BYT;\n'
                          '/dev/loop1:46.1MB:loopback:512:512:gpt:Loopback '
                          'device:;\n'
@@ -727,6 +769,16 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
         result = image._is_bootloader_loaded(self.fake_dev)
         self.assertFalse(result)
 
+    def test__is_bootloader_loaded_uefi_mode(self, mock_execute,
+                                             mock_dispatch):
+
+        mock_dispatch.return_value = hardware.BootInfo(
+            current_boot_mode='uefi')
+        result = image._is_bootloader_loaded(self.fake_dev)
+        self.assertFalse(result)
+        mock_dispatch.assert_any_call('get_boot_info')
+        self.assertEqual(0, mock_execute.call_count)
+
     @mock.patch.object(image, '_get_partition', autospec=True)
     @mock.patch.object(utils, 'get_efi_part_on_device', autospec=True)
     def test__manage_uefi_no_partition(self, mock_utils_efi_part,
@@ -752,9 +804,13 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
 
         mock_execute.side_effect = iter([('', ''), ('', ''),
                                          ('', ''), ('', ''),
+                                         ('', ''), ('', ''),
                                          ('', '')])
 
-        expected = [mock.call('mount', self.fake_efi_system_part,
+        expected = [mock.call('partx', '-u', '/dev/fake', attempts=3,
+                              delay_on_retry=True),
+                    mock.call('udevadm', 'settle'),
+                    mock.call('mount', self.fake_efi_system_part,
                               self.fake_dir + '/boot/efi'),
                     mock.call('efibootmgr'),
                     mock.call('efibootmgr', '-c', '-d', self.fake_dev,
@@ -770,7 +826,7 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
         mkdir_mock.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_efi_bl.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_execute.assert_has_calls(expected)
-        self.assertEqual(5, mock_execute.call_count)
+        self.assertEqual(7, mock_execute.call_count)
 
     @mock.patch.object(os.path, 'exists', lambda *_: False)
     @mock.patch.object(image, '_get_efi_bootloaders', autospec=True)
@@ -788,9 +844,13 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
 
         mock_execute.side_effect = iter([('', ''), ('', ''),
                                          ('', ''), ('', ''),
+                                         ('', ''), ('', ''),
                                          ('', '')])
 
-        expected = [mock.call('mount', self.fake_efi_system_part,
+        expected = [mock.call('partx', '-u', '/dev/fake', attempts=3,
+                              delay_on_retry=True),
+                    mock.call('udevadm', 'settle'),
+                    mock.call('mount', self.fake_efi_system_part,
                               self.fake_dir + '/boot/efi'),
                     mock.call('efibootmgr'),
                     mock.call('efibootmgr', '-c', '-d', self.fake_dev,
@@ -806,7 +866,7 @@ efibootmgr: ** Warning ** : Boot0005 has same label ironic1\n
         mkdir_mock.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_efi_bl.assert_called_once_with(self.fake_dir + '/boot/efi')
         mock_execute.assert_has_calls(expected)
-        self.assertEqual(5, mock_execute.call_count)
+        self.assertEqual(7, mock_execute.call_count)
 
     @mock.patch.object(os, 'walk', autospec=True)
     @mock.patch.object(os, 'access', autospec=False)

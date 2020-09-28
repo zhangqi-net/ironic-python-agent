@@ -71,12 +71,41 @@ def _download_with_proxy(image_info, url, image_id):
         os.environ['no_proxy'] = no_proxy
     proxies = image_info.get('proxies', {})
     verify, cert = utils.get_ssl_client_options(CONF)
-    resp = requests.get(url, stream=True, proxies=proxies,
-                        verify=verify, cert=cert)
-    if resp.status_code != 200:
-        msg = ('Received status code {} from {}, expected 200. Response '
-               'body: {}').format(resp.status_code, url, resp.text)
-        raise errors.ImageDownloadError(image_id, msg)
+    resp = None
+    for attempt in range(CONF.image_download_connection_retries + 1):
+        try:
+            # NOTE(TheJulia) The get request below does the following:
+            # * Performs dns lookups, if necessary
+            # * Opens the TCP socket to the remote host
+            # * Negotiates TLS, if applicable
+            # * Checks cert validity, if necessary, which may be
+            #   more tcp socket connections.
+            # * Issues the get request and then returns back to the caller the
+            #   handler which is used to stream the data into the agent.
+            # While this all may be at risk of transitory interrupts, most of
+            # these socket will have timeouts applied to them, although not
+            # exactly just as the timeout value exists. The risk in transitory
+            # failure is more so once we've started the download and we are
+            # processing the incoming data.
+            resp = requests.get(url, stream=True, proxies=proxies,
+                                verify=verify, cert=cert,
+                                timeout=CONF.image_download_connection_timeout)
+            if resp.status_code != 200:
+                msg = ('Received status code {} from {}, expected 200. '
+                       'Response body: {}').format(resp.status_code, url,
+                                                   resp.text)
+                raise errors.ImageDownloadError(image_id, msg)
+        except (errors.ImageDownloadError, requests.RequestException) as e:
+            if (attempt == CONF.image_download_connection_retries
+                    # NOTE(dtantsur): do not retry 4xx status codes
+                    or (resp and resp.status_code < 500)):
+                raise
+            else:
+                LOG.warning('Unable to connect to %s, retrying. Error: %s',
+                            url, e)
+                time.sleep(CONF.image_download_connection_retry_interval)
+        else:
+            break
     return resp
 
 
@@ -259,6 +288,7 @@ class ImageDownload(object):
                  any reason.
         """
         self._time = time_obj or time.time()
+        self._last_chunk_time = None
         self._image_info = image_info
         self._request = None
 
@@ -321,8 +351,25 @@ class ImageDownload(object):
                   which is a constant in this module.
         """
         for chunk in self._request.iter_content(IMAGE_CHUNK_SIZE):
-            self._hash_algo.update(chunk)
-            yield chunk
+            # Per requests forum posts/discussions, iter_content should
+            # periodically yield to the caller for the client to do things
+            # like stopwatch and potentially interrupt the download.
+            # While this seems weird and doesn't exactly seem to match the
+            # patterns in requests and urllib3, it does appear to be the
+            # case. Field testing in environments where TCP sockets were
+            # discovered in a read hanged state were navigated with
+            # this code.
+            if chunk:
+                self._last_chunk_time = time.time()
+                self._hash_algo.update(chunk)
+                yield chunk
+            elif (time.time() - self._last_chunk_time
+                  > CONF.image_download_connection_timeout):
+                LOG.error('Timeout reached waiting for a chunk of data from '
+                          'a remote server.')
+                raise errors.ImageDownloadError(
+                    self._image_info['id'],
+                    'Timed out reading next chunk from webserver')
 
     def verify_image(self, image_location):
         """Verifies the checksum of the local images matches expectations.
@@ -358,16 +405,30 @@ def _download_image(image_info):
     """
     starttime = time.time()
     image_location = _image_location(image_info)
-    image_download = ImageDownload(image_info, time_obj=starttime)
-
-    with open(image_location, 'wb') as f:
+    for attempt in range(CONF.image_download_connection_retries + 1):
         try:
-            for chunk in image_download:
-                f.write(chunk)
-        except Exception as e:
-            msg = 'Unable to write image to {}. Error: {}'.format(
-                image_location, str(e))
-            raise errors.ImageDownloadError(image_info['id'], msg)
+            image_download = ImageDownload(image_info, time_obj=starttime)
+
+            with open(image_location, 'wb') as f:
+                try:
+                    for chunk in image_download:
+                        f.write(chunk)
+                except Exception as e:
+                    msg = 'Unable to write image to {}. Error: {}'.format(
+                        image_location, str(e))
+                    raise errors.ImageDownloadError(image_info['id'], msg)
+        except errors.ImageDownloadError as e:
+            if attempt == CONF.image_download_connection_retries:
+                raise
+            else:
+                LOG.warning('Image download failed, %(attempt)s of %(total)s: '
+                            '%(error)s',
+                            {'attempt': attempt,
+                             'total': CONF.image_download_connection_retries,
+                             'error': e})
+                time.sleep(CONF.image_download_connection_retry_interval)
+        else:
+            break
 
     totaltime = time.time() - starttime
     LOG.info("Image downloaded from {} in {} seconds".format(image_location,
@@ -502,16 +563,31 @@ class StandbyExtension(base.BaseAgentExtension):
              match the checksum as reported by glance in image_info.
         """
         starttime = time.time()
-        image_download = ImageDownload(image_info, time_obj=starttime)
-
-        with open(device, 'wb+') as f:
+        total_retries = CONF.image_download_connection_retries
+        for attempt in range(total_retries + 1):
             try:
-                for chunk in image_download:
-                    f.write(chunk)
-            except Exception as e:
-                msg = 'Unable to write image to device {}. Error: {}'.format(
-                      device, str(e))
-                raise errors.ImageDownloadError(image_info['id'], msg)
+                image_download = ImageDownload(image_info, time_obj=starttime)
+
+                with open(device, 'wb+') as f:
+                    try:
+                        for chunk in image_download:
+                            f.write(chunk)
+                    except Exception as e:
+                        msg = ('Unable to write image to device {}. '
+                               'Error: {}').format(device, str(e))
+                        raise errors.ImageDownloadError(image_info['id'], msg)
+            except errors.ImageDownloadError as e:
+                if attempt == CONF.image_download_connection_retries:
+                    raise
+                else:
+                    LOG.warning('Image download failed, %(attempt)s of '
+                                '%(total)s: %(error)s',
+                                {'attempt': attempt,
+                                 'total': total_retries,
+                                 'error': e})
+                    time.sleep(CONF.image_download_connection_retry_interval)
+            else:
+                break
 
         totaltime = time.time() - starttime
         LOG.info("Image streamed onto device {} in {} "

@@ -14,9 +14,11 @@
 
 import os
 import tempfile
+import time
 
 import mock
 from oslo_concurrency import processutils
+import requests
 
 from ironic_python_agent import errors
 from ironic_python_agent.extensions import standby
@@ -356,7 +358,8 @@ class TestStandbyExtension(base.IronicAgentTest):
         standby._download_image(image_info)
         requests_mock.assert_called_once_with(image_info['urls'][0],
                                               cert=None, verify=True,
-                                              stream=True, proxies={})
+                                              stream=True, proxies={},
+                                              timeout=60)
         write = file_mock.write
         write.assert_any_call('some')
         write.assert_any_call('content')
@@ -387,7 +390,8 @@ class TestStandbyExtension(base.IronicAgentTest):
         self.assertEqual(no_proxy, os.environ['no_proxy'])
         requests_mock.assert_called_once_with(image_info['urls'][0],
                                               cert=None, verify=True,
-                                              stream=True, proxies=proxies)
+                                              stream=True, proxies=proxies,
+                                              timeout=60)
         write = file_mock.write
         write.assert_any_call('some')
         write.assert_any_call('content')
@@ -395,6 +399,7 @@ class TestStandbyExtension(base.IronicAgentTest):
 
     @mock.patch('requests.get', autospec=True)
     def test_download_image_bad_status(self, requests_mock):
+        self.config(image_download_connection_retry_interval=0)
         image_info = _build_fake_image_info()
         response = requests_mock.return_value
         response.status_code = 404
@@ -1065,7 +1070,8 @@ class TestStandbyExtension(base.IronicAgentTest):
                                                            '/dev/foo')
         requests_mock.assert_called_once_with(image_info['urls'][0],
                                               cert=None, verify=True,
-                                              stream=True, proxies={})
+                                              stream=True, proxies={},
+                                              timeout=60)
         expected_calls = [mock.call('some'), mock.call('content')]
         file_mock.write.assert_has_calls(expected_calls)
 
@@ -1074,6 +1080,8 @@ class TestStandbyExtension(base.IronicAgentTest):
     @mock.patch('requests.get', autospec=True)
     def test_stream_raw_image_onto_device_write_error(self, requests_mock,
                                                       open_mock, md5_mock):
+        self.config(image_download_connection_timeout=1)
+        self.config(image_download_connection_retry_interval=0)
         image_info = _build_fake_image_info()
         response = requests_mock.return_value
         response.status_code = 200
@@ -1087,11 +1095,20 @@ class TestStandbyExtension(base.IronicAgentTest):
         self.assertRaises(errors.ImageDownloadError,
                           self.agent_extension._stream_raw_image_onto_device,
                           image_info, '/dev/foo')
-        requests_mock.assert_called_once_with(image_info['urls'][0],
-                                              cert=None, verify=True,
-                                              stream=True, proxies={})
-        # Assert write was only called once and failed!
-        file_mock.write.assert_called_once_with('some')
+        calls = [mock.call('http://example.org', cert=None, proxies={},
+                           stream=True, timeout=1, verify=True),
+                 mock.call().iter_content(mock.ANY),
+                 mock.call('http://example.org', cert=None, proxies={},
+                           stream=True, timeout=1, verify=True),
+                 mock.call().iter_content(mock.ANY),
+                 mock.call('http://example.org', cert=None, proxies={},
+                           stream=True, timeout=1, verify=True),
+                 mock.call().iter_content(mock.ANY)]
+        requests_mock.assert_has_calls(calls)
+        write_calls = [mock.call('some'),
+                       mock.call('some'),
+                       mock.call('some')]
+        file_mock.write.assert_has_calls(write_calls)
 
     @mock.patch('ironic_lib.disk_utils.get_disk_identifier',
                 lambda dev: 'ROOT')
@@ -1105,6 +1122,71 @@ class TestStandbyExtension(base.IronicAgentTest):
         expected_msg = ('image (fake_id) already present on device '
                         '/dev/fake root_uuid=ROOT')
         self.assertEqual(expected_msg, result_msg)
+
+    @mock.patch('ironic_lib.disk_utils.fix_gpt_partition', autospec=True)
+    @mock.patch('hashlib.md5', autospec=True)
+    @mock.patch('six.moves.builtins.open', autospec=True)
+    @mock.patch('requests.get', autospec=True)
+    def test_stream_raw_image_onto_device_socket_read_timeout(
+            self, requests_mock, open_mock, md5_mock, fix_gpt_mock):
+
+        class create_timeout(object):
+            status_code = 200
+
+            def __init__(self, url, stream, proxies, verify, cert, timeout):
+                time.sleep(1)
+                self.count = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.count:
+                    time.sleep(0.1)
+                    return None
+                if self.count < 3:
+                    self.count += 1
+                    return "meow"
+                else:
+                    time.sleep(30)
+                    raise StopIteration
+
+            # Python 2
+            next = __next__
+
+            def iter_content(self, chunk_size):
+                return self
+
+        self.config(image_download_connection_timeout=1)
+        self.config(image_download_connection_retries=2)
+        self.config(image_download_connection_retry_interval=0)
+        image_info = _build_fake_image_info()
+        file_mock = mock.Mock()
+        open_mock.return_value.__enter__.return_value = file_mock
+        file_mock.read.return_value = None
+        hexdigest_mock = md5_mock.return_value.hexdigest
+        hexdigest_mock.return_value = image_info['checksum']
+        requests_mock.side_effect = create_timeout
+        self.assertRaisesRegex(
+            errors.ImageDownloadError,
+            'Timed out reading next chunk',
+            self.agent_extension._stream_raw_image_onto_device,
+            image_info,
+            '/dev/foo')
+
+        calls = [mock.call(image_info['urls'][0], cert=None, verify=True,
+                           stream=True, proxies={}, timeout=1),
+                 mock.call(image_info['urls'][0], cert=None, verify=True,
+                           stream=True, proxies={}, timeout=1),
+                 mock.call(image_info['urls'][0], cert=None, verify=True,
+                           stream=True, proxies={}, timeout=1)]
+        requests_mock.assert_has_calls(calls)
+
+        write_calls = [mock.call('meow'),
+                       mock.call('meow'),
+                       mock.call('meow')]
+        file_mock.write.assert_has_calls(write_calls)
+        self.assertFalse(fix_gpt_mock.called)
 
     def test__message_format_partition_bios(self):
         image_info = _build_fake_partition_image_info()
@@ -1180,11 +1262,13 @@ class TestImageDownload(base.IronicAgentTest):
         self.assertEqual(content, list(image_download))
         requests_mock.assert_called_once_with(image_info['urls'][0],
                                               cert=None, verify=True,
-                                              stream=True, proxies={})
+                                              stream=True, proxies={},
+                                              timeout=60)
         self.assertEqual(image_info['checksum'],
                          image_download._hash_algo.hexdigest())
 
-    def test_download_image_fail(self, requests_mock, time_mock):
+    @mock.patch('time.sleep', autospec=True)
+    def test_download_image_fail(self, sleep_mock, requests_mock, time_mock):
         response = requests_mock.return_value
         response.status_code = 401
         response.text = 'Unauthorized'
@@ -1198,7 +1282,57 @@ class TestImageDownload(base.IronicAgentTest):
                                standby.ImageDownload, image_info)
         requests_mock.assert_called_once_with(image_info['urls'][0],
                                               cert=None, verify=True,
-                                              stream=True, proxies={})
+                                              stream=True, proxies={},
+                                              timeout=60)
+        self.assertFalse(sleep_mock.called)
+
+    @mock.patch('time.sleep', autospec=True)
+    def test_download_image_retries(self, sleep_mock, requests_mock,
+                                    time_mock):
+        self.config(image_download_connection_retries=2)
+        response = requests_mock.return_value
+        response.status_code = 500
+        response.text = 'Oops'
+        time_mock.return_value = 0.0
+        image_info = _build_fake_image_info()
+        msg = ('Error downloading image: Download of image fake_id failed: '
+               'URL: http://example.org; time: .* seconds. Error: '
+               'Received status code 500 from http://example.org, expected '
+               '200. Response body: Oops')
+        self.assertRaisesRegex(errors.ImageDownloadError, msg,
+                               standby.ImageDownload, image_info)
+        requests_mock.assert_called_with(image_info['urls'][0],
+                                         cert=None, verify=True,
+                                         stream=True, proxies={},
+                                         timeout=60)
+        self.assertEqual(3, requests_mock.call_count)
+        sleep_mock.assert_called_with(10)
+        self.assertEqual(2, sleep_mock.call_count)
+
+    @mock.patch('time.sleep', autospec=True)
+    def test_download_image_retries_success(self, sleep_mock, requests_mock,
+                                            md5_mock):
+        content = ['SpongeBob', 'SquarePants']
+        fail_response = mock.Mock()
+        fail_response.status_code = 500
+        fail_response.text = " "
+        response = mock.Mock()
+        response.status_code = 200
+        response.iter_content.return_value = content
+        requests_mock.side_effect = [requests.Timeout, fail_response, response]
+
+        image_info = _build_fake_image_info()
+        md5_mock.return_value.hexdigest.return_value = image_info['checksum']
+        image_download = standby.ImageDownload(image_info)
+
+        self.assertEqual(content, list(image_download))
+        requests_mock.assert_called_with(image_info['urls'][0],
+                                         cert=None, verify=True,
+                                         stream=True, proxies={},
+                                         timeout=60)
+        self.assertEqual(3, requests_mock.call_count)
+        sleep_mock.assert_called_with(10)
+        self.assertEqual(2, sleep_mock.call_count)
 
     def test_download_image_and_checksum(self, requests_mock, md5_mock):
         content = ['SpongeBob', 'SquarePants']
@@ -1219,9 +1353,9 @@ class TestImageDownload(base.IronicAgentTest):
         self.assertEqual(content, list(image_download))
         requests_mock.assert_has_calls([
             mock.call('http://example.com/checksum', cert=None, verify=True,
-                      stream=True, proxies={}),
+                      stream=True, proxies={}, timeout=60),
             mock.call(image_info['urls'][0], cert=None, verify=True,
-                      stream=True, proxies={}),
+                      stream=True, proxies={}, timeout=60),
         ])
         self.assertEqual(fake_cs, image_download._hash_algo.hexdigest())
 
@@ -1249,9 +1383,9 @@ foobar  irrelevant file.img
         self.assertEqual(content, list(image_download))
         requests_mock.assert_has_calls([
             mock.call('http://example.com/checksum', cert=None, verify=True,
-                      stream=True, proxies={}),
+                      stream=True, proxies={}, timeout=60),
             mock.call(image_info['urls'][0], cert=None, verify=True,
-                      stream=True, proxies={}),
+                      stream=True, proxies={}, timeout=60),
         ])
         self.assertEqual(fake_cs, image_download._hash_algo.hexdigest())
 
@@ -1297,6 +1431,7 @@ foobar  irrelevant file.img
                                standby.ImageDownload, image_info)
 
     def test_download_image_and_checksum_failed(self, requests_mock, md5_mock):
+        self.config(image_download_connection_retry_interval=0)
         content = ['SpongeBob', 'SquarePants']
         cs_response = mock.Mock()
         cs_response.status_code = 400
@@ -1304,7 +1439,9 @@ foobar  irrelevant file.img
         response = mock.Mock()
         response.status_code = 200
         response.iter_content.return_value = content
-        requests_mock.side_effect = [cs_response, response]
+        # 3 retries on status code
+        requests_mock.side_effect = [cs_response, cs_response, cs_response,
+                                     response]
 
         image_info = _build_fake_image_info(
             'http://example.com/path/image.img')

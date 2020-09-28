@@ -215,6 +215,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         self.hardware_initialization_delay = hardware_initialization_delay
         # IPA will stop serving requests and exit after this is set to False
         self.serve_api = True
+        self.iscsi_started = False
 
     def get_status(self):
         """Retrieve a serializable status.
@@ -387,6 +388,10 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
             # Inspection should be started before call to lookup, otherwise
             # lookup will fail due to unknown MAC.
             uuid = None
+            # We can't try to inspect or heartbeat until we have valid
+            # interfaces to perform those actions over.
+            self._wait_for_interface()
+
             if cfg.CONF.inspection_callback_url:
                 try:
                     # Attempt inspection. This may fail, and previously
@@ -396,10 +401,8 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                     LOG.error('Failed to perform inspection: %s', e)
 
             if self.api_url:
-                self._wait_for_interface()
                 content = self.api_client.lookup_node(
-                    hardware_info=hardware.dispatch_to_managers(
-                        'list_hardware_info'),
+                    hardware_info=hardware.list_hardware_info(use_cache=True),
                     timeout=self.lookup_timeout,
                     starting_interval=self.lookup_interval,
                     node_uuid=uuid)
@@ -423,6 +426,9 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                 LOG.info('No ipa-api-url configured, Heartbeat and lookup '
                          'skipped for inspector.')
             else:
+                # NOTE(TheJulia): Once communication flow capability is
+                # able to be driven solely from the conductor, this is no
+                # longer a major issue.
                 LOG.error('Neither ipa-api-url nor inspection_callback_url'
                           'found, please check your pxe append parameters.')
 

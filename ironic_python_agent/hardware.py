@@ -255,7 +255,8 @@ def _md_scan_and_assemble():
 
 def list_all_block_devices(block_type='disk',
                            ignore_raid=False,
-                           ignore_floppy=True):
+                           ignore_floppy=True,
+                           ignore_empty=True):
     """List all physical block devices
 
     The switches we use for lsblk: P for KEY="value" output, b for size output
@@ -271,6 +272,7 @@ def list_all_block_devices(block_type='disk',
                         devices and should be treated as such if encountered.
     :param ignore_floppy: Ignore floppy disk devices in the block device
                           list. By default, these devices are filtered out.
+    :param ignore_empty: Whether to ignore disks with size equal 0.
     :return: A list of BlockDevices
     """
 
@@ -338,12 +340,24 @@ def list_all_block_devices(block_type='disk',
         # Other possible type values, which we skip recording:
         #   lvm, part, rom, loop
         if devtype != block_type:
-            if (devtype is not None and
-                any(x in devtype for x in ['raid', 'md']) and
-                not ignore_raid):
+            if (devtype is None or ignore_raid):
+                LOG.debug("Skipping: {!r}".format(line))
+                continue
+            elif ('raid' in devtype
+                  and block_type in ['raid', 'disk']):
                 LOG.debug(
-                    "TYPE detected to contain 'raid' or 'md', signifying a "
+                    "TYPE detected to contain 'raid', signifying a "
                     "RAID volume. Found: {!r}".format(line))
+            elif (devtype == 'md'
+                  and (block_type == 'part'
+                       or block_type == 'md')):
+                # NOTE(dszumski): Partitions on software RAID devices have type
+                # 'md'. This may also contain RAID devices in a broken state in
+                # rare occasions. See https://review.opendev.org/#/c/670807 for
+                # more detail.
+                LOG.debug(
+                    "TYPE detected to contain 'md', signifying a "
+                    "RAID partition. Found: {!r}".format(line))
             else:
                 LOG.debug(
                     "TYPE did not match. Wanted: {!r} but found: {!r}".format(
@@ -361,6 +375,12 @@ def list_all_block_devices(block_type='disk',
         if (device['KNAME'].startswith('ram')
                 or device['KNAME'].startswith('zram')):
             LOG.debug('Skipping RAM device %s', device)
+            continue
+
+        # NOTE(dtantsur): some hardware represents virtual floppy devices as
+        # normal block devices with size 0. Filter them out.
+        if ignore_empty and not int(device['SIZE'] or 0):
+            LOG.debug('Skipping device %s with zero size', device)
             continue
 
         name = os.path.join('/dev', device['KNAME'])
@@ -653,6 +673,8 @@ class HardwareManager(object):
 
         :return: a dictionary representing inventory
         """
+        start = time.time()
+        LOG.info('Collecting full inventory')
         # NOTE(dtantsur): don't forget to update docs when extending inventory
         hardware_info = {}
         hardware_info['interfaces'] = self.list_network_interfaces()
@@ -664,6 +686,7 @@ class HardwareManager(object):
         hardware_info['system_vendor'] = self.get_system_vendor_info()
         hardware_info['boot'] = self.get_boot_info()
         hardware_info['hostname'] = netutils.get_hostname()
+        LOG.info('Inventory collected in %.2f second(s)', time.time() - start)
         return hardware_info
 
     def get_clean_steps(self, node, ports):
@@ -1682,7 +1705,18 @@ class GenericHardwareManager(HardwareManager):
             utils.execute('mdadm', '--assemble', '--scan',
                           check_exit_code=False)
             raid_devices = list_all_block_devices(block_type='raid',
-                                                  ignore_raid=False)
+                                                  ignore_raid=False,
+                                                  ignore_empty=False)
+            # NOTE(dszumski): Fetch all devices of type 'md'. This
+            # will generally contain partitions on a software RAID
+            # device, but crucially may also contain devices in a
+            # broken state. See https://review.opendev.org/#/c/670807/
+            # for more detail.
+            raid_devices.extend(
+                list_all_block_devices(block_type='md',
+                                       ignore_raid=False,
+                                       ignore_empty=False)
+            )
             return raid_devices
 
         raid_devices = _scan_raids()
@@ -2012,6 +2046,23 @@ def load_managers():
     :raises HardwareManagerNotFound: if no valid hardware managers found
     """
     _get_managers()
+
+
+_CACHED_HW_INFO = None
+
+
+def list_hardware_info(use_cache=True):
+    """List hardware information with caching."""
+    global _CACHED_HW_INFO
+
+    if _CACHED_HW_INFO is None:
+        _CACHED_HW_INFO = dispatch_to_managers('list_hardware_info')
+        return _CACHED_HW_INFO
+
+    if use_cache:
+        return _CACHED_HW_INFO
+    else:
+        return dispatch_to_managers('list_hardware_info')
 
 
 def cache_node(node):

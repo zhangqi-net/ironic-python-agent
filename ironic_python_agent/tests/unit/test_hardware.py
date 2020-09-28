@@ -143,7 +143,8 @@ BLK_DEVICE_TEMPLATE = (
     'KNAME="ram1" MODEL="" SIZE="8388608" ROTA="0" TYPE="disk"\n'
     'KNAME="ram2" MODEL="" SIZE="8388608" ROTA="0" TYPE="disk"\n'
     'KNAME="ram3" MODEL="" SIZE="8388608" ROTA="0" TYPE="disk"\n'
-    'KNAME="fd1" MODEL="magic" SIZE="4096" ROTA="1" TYPE="disk"'
+    'KNAME="fd1" MODEL="magic" SIZE="4096" ROTA="1" TYPE="disk"\n'
+    'KNAME="sdf" MODEL="virtual floppy" SIZE="0" ROTA="1" TYPE="disk"'
 )
 
 # NOTE(pas-ha) largest device is 1 byte smaller than 4GiB
@@ -164,17 +165,29 @@ BLK_DEVICE_TEMPLATE_SMALL_DEVICES = [
 
 # NOTE(TheJulia): This list intentionally contains duplicates
 # as the code filters them out by kernel device name.
+# NOTE(dszumski): We include some partitions here to verify that
+# they are filtered out when not requested. It is assumed that
+# ROTA has been set to 0 on some software RAID devices for testing
+# purposes. In practice is appears to inherit from the underyling
+# devices, so in this example it would normally be 1.
 RAID_BLK_DEVICE_TEMPLATE = (
     'KNAME="sda" MODEL="DRIVE 0" SIZE="1765517033472" '
     'ROTA="1" TYPE="disk"\n'
+    'KNAME="sda1" MODEL="DRIVE 0" SIZE="107373133824" '
+    'ROTA="1" TYPE="part"\n'
     'KNAME="sdb" MODEL="DRIVE 1" SIZE="1765517033472" '
     'ROTA="1" TYPE="disk"\n'
     'KNAME="sdb" MODEL="DRIVE 1" SIZE="1765517033472" '
     'ROTA="1" TYPE="disk"\n'
+    'KNAME="sdb1" MODEL="DRIVE 1" SIZE="107373133824" '
+    'ROTA="1" TYPE="part"\n'
+    'KNAME="md0p1" MODEL="RAID" SIZE="107236818944" '
+    'ROTA="0" TYPE="md"\n'
     'KNAME="md0" MODEL="RAID" SIZE="1765517033470" '
     'ROTA="0" TYPE="raid1"\n'
     'KNAME="md0" MODEL="RAID" SIZE="1765517033470" '
-    'ROTA="0" TYPE="raid1"'
+    'ROTA="0" TYPE="raid1"\n'
+    'KNAME="md1" MODEL="RAID" SIZE="" ROTA="0" TYPE="raid1"'
 )
 RAID_BLK_DEVICE_TEMPLATE_DEVICES = [
     hardware.BlockDevice(name='/dev/sda', model='DRIVE 0',
@@ -185,6 +198,9 @@ RAID_BLK_DEVICE_TEMPLATE_DEVICES = [
                          vendor="FooTastic"),
     hardware.BlockDevice(name='/dev/md0', model='RAID',
                          size=1765517033470, rotational=False,
+                         vendor="FooTastic"),
+    hardware.BlockDevice(name='/dev/md1', model='RAID',
+                         size=0, rotational=False,
                          vendor="FooTastic"),
 ]
 
@@ -3231,9 +3247,11 @@ class TestGenericHardwareManager(base.IronicAgentTest):
 
         hardware.list_all_block_devices.side_effect = [
             [raid_device1, raid_device2],  # list_all_block_devices raid
+            [],  # list_all_block_devices raid (md)
             [sda, sdb, sdc],  # list_all_block_devices disks
             [],  # list_all_block_devices parts
             [],  # list_all_block_devices raid
+            [],  # list_all_block_devices raid (md)
         ]
         mocked_get_component.side_effect = [
             ["/dev/sda1", "/dev/sdb1"],
@@ -3313,13 +3331,14 @@ class TestGenericHardwareManager(base.IronicAgentTest):
         raid_device1_part1 = hardware.BlockDevice('/dev/md0p1', 'RAID-1',
                                                   1073741824, True)
         hardware.list_all_block_devices.side_effect = [
-            [raid_device1_part1],  # list_all_block_devices raid
+            [],  # list_all_block_devices raid
+            [raid_device1_part1],  # list_all_block_devices raid (md)
             [],  # list_all_block_devices disks
             [],  # list_all_block_devices parts
             [],  # list_all_block_devices raid
+            [],  # list_all_block_devices raid (md)
         ]
         mocked_get_component.return_value = []
-
         self.assertIsNone(self.hardware.delete_configuration(self.node, []))
         mocked_execute.assert_has_calls([
             mock.call('mdadm', '--assemble', '--scan', check_exit_code=False),
@@ -3340,12 +3359,15 @@ class TestGenericHardwareManager(base.IronicAgentTest):
 
         hardware.list_all_block_devices.side_effect = [
             [raid_device1],  # list_all_block_devices raid
+            [],  # list_all_block_devices raid (type md)
             [],  # list_all_block_devices disks
             [],  # list_all_block_devices parts
             [raid_device1],  # list_all_block_devices raid
+            [],  # list_all_block_devices raid (type md)
             [],  # list_all_block_devices disks
             [],  # list_all_block_devices parts
             [raid_device1],  # list_all_block_devices raid
+            [],  # list_all_block_devices raid (type md)
         ]
         mocked_get_component.return_value = []
 
@@ -3657,7 +3679,7 @@ class TestModuleFunctions(base.IronicAgentTest):
         mocked_readlink.return_value = '../../sda'
         mocked_fromdevfile.return_value = {}
         mocked_execute.return_value = (RAID_BLK_DEVICE_TEMPLATE, '')
-        result = hardware.list_all_block_devices()
+        result = hardware.list_all_block_devices(ignore_empty=False)
         mocked_execute.assert_called_once_with(
             'lsblk', '-Pbia', '-oKNAME,MODEL,SIZE,ROTA,TYPE',
             check_exit_code=[0])
@@ -3728,3 +3750,22 @@ def create_hdparm_info(supported=False, enabled=False, locked=False,
     update_values(values, enhanced_erase, 'enhanced_erase')
 
     return HDPARM_INFO_TEMPLATE % values
+
+
+@mock.patch('ironic_python_agent.hardware.dispatch_to_managers',
+            autospec=True)
+class TestListHardwareInfo(base.IronicAgentTest):
+
+    def test_caching(self, mock_dispatch):
+        fake_info = {'I am': 'hardware'}
+        mock_dispatch.return_value = fake_info
+
+        self.assertEqual(fake_info, hardware.list_hardware_info())
+        self.assertEqual(fake_info, hardware.list_hardware_info())
+        mock_dispatch.assert_called_once_with('list_hardware_info')
+
+        self.assertEqual(fake_info,
+                         hardware.list_hardware_info(use_cache=False))
+        self.assertEqual(fake_info, hardware.list_hardware_info())
+        mock_dispatch.assert_called_with('list_hardware_info')
+        self.assertEqual(2, mock_dispatch.call_count)

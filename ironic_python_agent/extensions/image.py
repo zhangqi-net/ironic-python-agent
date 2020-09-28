@@ -37,20 +37,28 @@ BIND_MOUNTS = ('/dev', '/proc', '/run')
 BOOTLOADERS_EFI = ['bootx64.efi', 'grubaa64.efi', 'winload.efi']
 
 
+def _rescan_device(device):
+    """Force the device to be rescanned
+
+    :param device: device upon which to rescan and update
+                   kernel partition records.
+    """
+    try:
+        utils.execute('partx', '-u', device, attempts=3,
+                      delay_on_retry=True)
+        utils.execute('udevadm', 'settle')
+    except processutils.ProcessExecutionError:
+        LOG.warning("Couldn't re-read the partition table "
+                    "on device %s", device)
+
+
 def _get_partition(device, uuid):
     """Find the partition of a given device."""
     LOG.debug("Find the partition %(uuid)s on device %(dev)s",
               {'dev': device, 'uuid': uuid})
 
     try:
-        # Try to tell the kernel to re-read the partition table
-        try:
-            utils.execute('partx', '-u', device, attempts=3,
-                          delay_on_retry=True)
-            utils.execute('udevadm', 'settle')
-        except processutils.ProcessExecutionError:
-            LOG.warning("Couldn't re-read the partition table "
-                        "on device %s", device)
+        _rescan_device(device)
 
         # If the deploy device is an md device, we want to install on
         # the first partition. We clearly take a shortcut here for now.
@@ -159,6 +167,14 @@ def _is_bootloader_loaded(dev):
                 return True
         return False
 
+    boot = hardware.dispatch_to_managers('get_boot_info')
+
+    if boot.current_boot_mode != 'bios':
+        # We're in UEFI mode, this logic is invalid
+        LOG.debug('Skipping boot sector check as the system is in UEFI '
+                  'boot mode.')
+        return False
+
     try:
         # Looking for things marked "bootable" in the partition table
         stdout, stderr = utils.execute('parted', dev, '-s', '-m',
@@ -259,6 +275,10 @@ def _manage_uefi(device, efi_system_part_uuid=None):
     efi_mounted = False
 
     try:
+        # Force UEFI to rescan the device. Required if the deployment
+        # was over iscsi.
+        _rescan_device(device)
+
         local_path = tempfile.mkdtemp()
         # Trust the contents on the disk in the event of a whole disk image.
         efi_partition = utils.get_efi_part_on_device(device)
@@ -330,16 +350,24 @@ def _install_grub2(device, root_uuid, efi_system_part_uuid=None,
                    prep_boot_part_uuid=None):
     """Install GRUB2 bootloader on a given device."""
     LOG.debug("Installing GRUB2 bootloader on device %s", device)
-    root_partition = _get_partition(device, uuid=root_uuid)
+
     efi_partition = None
     efi_partition_mount_point = None
     efi_mounted = False
+
+    # NOTE(TheJulia): Seems we need to get this before ever possibly
+    # restart the device in the case of multi-device RAID as pyudev
+    # doesn't exactly like the partition disappearing.
+    root_partition = _get_partition(device, uuid=root_uuid)
 
     # If the root device is an md device (or partition), restart the device
     # (to help grub finding it) and identify the underlying holder disks
     # to install grub.
     if hardware.is_md_device(device):
         hardware.md_restart(device)
+        # If an md device, we need to rescan the devices anyway to pickup
+        # the md device partition.
+        _rescan_device(device)
     elif (_is_bootloader_loaded(device)
           and not (efi_system_part_uuid
                    or prep_boot_part_uuid)):
@@ -512,13 +540,20 @@ class ImageExtension(base.BaseAgentExtension):
 
         """
         device = hardware.dispatch_to_managers('get_os_install_device')
-        iscsi.clean_up(device)
+        if self.agent.iscsi_started:
+            iscsi.clean_up(device)
         boot = hardware.dispatch_to_managers('get_boot_info')
         if boot.current_boot_mode == 'uefi':
             has_efibootmgr = True
+            # NOTE(iurygregory): adaptation for py27 since we don't have
+            # FileNotFoundError defined.
+            try:
+                FileNotFoundError
+            except NameError:
+                FileNotFoundError = OSError
             try:
                 utils.execute('efibootmgr', '--version')
-            except errors.CommandExecutionError:
+            except FileNotFoundError:
                 LOG.warning("efibootmgr is not available in the ramdisk")
                 has_efibootmgr = False
 
